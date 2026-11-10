@@ -1,0 +1,135 @@
+name: NovaStream ZIP to Android APKs
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_path:
+        description: 'Repository-relative path to the NovaStream source ZIP'
+        required: true
+        default: 'novastream_v4_verified_source.zip'
+
+permissions:
+  contents: read
+
+
+concurrency:
+  group: novastream-zip-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Extract ZIP and build Android APKs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (to access source ZIP)
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Validate and extract source ZIP
+        id: extract
+        env:
+          ARCHIVE_PATH: ${{ inputs.archive_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f "$ARCHIVE_PATH" ]]; then
+            echo "::error::Source ZIP not found: $ARCHIVE_PATH"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import os
+          import stat
+          import zipfile
+          from pathlib import Path
+
+          archive = Path(os.environ['ARCHIVE_PATH'])
+          destination = Path('source_unzipped').resolve()
+          destination.mkdir(parents=True, exist_ok=True)
+
+          with zipfile.ZipFile(archive) as zf:
+              bad = zf.testzip()
+              if bad:
+                  raise SystemExit(f'Corrupt ZIP entry: {bad}')
+
+              for item in zf.infolist():
+                  name = item.filename.replace('\\', '/')
+                  mode = item.external_attr >> 16
+                  if name.startswith('/') or any(part == '..' for part in name.split('/')):
+                      raise SystemExit(f'Unsafe ZIP entry: {item.filename}')
+                  if stat.S_ISLNK(mode):
+                      raise SystemExit(f'Symbolic links are not allowed in source ZIP: {item.filename}')
+                  target = (destination / name).resolve()
+                  if target != destination and destination not in target.parents:
+                      raise SystemExit(f'ZIP entry escapes extraction directory: {item.filename}')
+              zf.extractall(destination)
+
+          projects = sorted(destination.rglob('pubspec.yaml'))
+          projects = [p.parent for p in projects if (p.parent / 'android').is_dir()]
+          if not projects:
+              raise SystemExit('No Flutter Android project found: ZIP must contain pubspec.yaml and android/.')
+          min_depth = min(len(p.relative_to(destination).parts) for p in projects)
+          projects = [p for p in projects if len(p.relative_to(destination).parts) == min_depth]
+          if len(projects) != 1:
+              raise SystemExit('Multiple Flutter Android projects found at the same top-level depth. Package only the intended app in the ZIP.')
+
+          project = projects[0]
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f'project_dir={project}\n')
+          print(f'Flutter project extracted to: {project}')
+          PY
+
+      - name: Install Flutter dependencies
+        working-directory: ${{ steps.extract.outputs.project_dir }}
+        run: flutter pub get
+
+      - name: Build debug APK
+        working-directory: ${{ steps.extract.outputs.project_dir }}
+        run: flutter build apk --debug
+
+      - name: Build universal release APK
+        working-directory: ${{ steps.extract.outputs.project_dir }}
+        run: flutter build apk --release
+
+      - name: Build split-per-ABI release APKs
+        working-directory: ${{ steps.extract.outputs.project_dir }}
+        run: flutter build apk --release --split-per-abi
+
+      - name: Collect APKs
+        env:
+          PROJECT_DIR: ${{ steps.extract.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find "$PROJECT_DIR/build/app/outputs/flutter-apk" -maxdepth 1 -type f -name '*.apk' -exec cp {} dist/ \;
+          if ! compgen -G 'dist/*.apk' > /dev/null; then
+            echo '::error::No APK files were produced.'
+            exit 1
+          fi
+          {
+            echo "Commit: $GITHUB_SHA"
+            echo "Built at (UTC): $(date -u +%FT%TZ)"
+            echo "APK files and SHA-256:"
+            sha256sum dist/*.apk
+          } > dist/BUILD-REPORT.txt
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: novastream-android-apks
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+          
