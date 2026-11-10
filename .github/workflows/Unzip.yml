@@ -1,0 +1,61 @@
+name: NovaStream ZIP Extractor
+
+on:
+  workflow_dispatch:
+    inputs:
+      archive_path:
+        description: 'Repository-relative path to the ZIP file'
+        required: true
+        default: 'novastream_v4_verified_source.zip'
+
+permissions:
+  contents: read
+
+jobs:
+  unzip:
+    name: Extract NovaStream source ZIP
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Validate and extract ZIP safely
+        env:
+          ARCHIVE_PATH: ${{ inputs.archive_path }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! -f "$ARCHIVE_PATH" ]]; then
+            echo "::error::ZIP file not found: $ARCHIVE_PATH"
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import os
+          import zipfile
+
+          archive = os.environ["ARCHIVE_PATH"]
+          destination = "unzipped"
+
+          os.makedirs(destination, exist_ok=True)
+
+          with zipfile.ZipFile(archive) as zf:
+              root = os.path.realpath(destination)
+              for item in zf.infolist():
+                  target = os.path.realpath(os.path.join(destination, item.filename))
+                  if target != root and not target.startswith(root + os.sep):
+                      raise SystemExit(f"Unsafe ZIP entry path: {item.filename}")
+              zf.extractall(destination)
+
+          print(f"Extracted {archive} into {destination}/")
+          PY
+
+      - name: Upload extracted source
+        uses: actions/upload-artifact@v4
+        with:
+          name: novastream-unzipped-source
+          path: unzipped/
+          if-no-files-found: error
+          retention-days: 14
+          
